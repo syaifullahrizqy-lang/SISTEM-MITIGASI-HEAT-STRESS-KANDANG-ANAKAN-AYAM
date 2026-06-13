@@ -1,1 +1,146 @@
 # SISTEM-MITIGASI-HEAT-STRESS-KANDANG-ANAKAN-AYAM
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <SimpleDHT.h>
+
+// 1. Konfigurasi Wi-Fi & MQTT Broker Kelompok 4
+const char* ssid        = "vvv";     
+const char* password    = "18022006"; 
+const char* mqtt_broker = "broker.emqx.io";     
+const int   mqtt_port   = 1883;
+// Topik baru sesuai konfigurasi Node-RED terakhir
+const char* mqtt_topic  = "mitigasiheatstress/anakayam/kelompok4"; 
+
+// 2. Alokasi Pinout NodeMCU-32S (Sesuai Rancangan Hardware)
+#define PIN_DHT 4            // Sensor DHT11 di P4
+#define PIN_MQ135 35         // Sensor MQ-135 di P35 (ADC1)
+#define PIN_BLOWER_DINGIN 27 // Relay Blower Pendingin di P27
+#define PIN_PAKET_PEMANAS 26 // Relay Pemanas di P26
+#define PIN_BUZZER 25        // Buzzer Alarm di P25
+
+SimpleDHT11 dht11(PIN_DHT);
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// 3. Batas Ambang (Threshold) Kandang Anakan Ayam
+const float AMBANG_SUHU_PANAS = 32.0;  
+const float AMBANG_SUHU_DINGIN = 26.0; 
+const int AMBANG_AMONIA = 2500;        
+
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Menghubungkan ke ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi Terhubung!");
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Mencoba koneksi MQTT Kelompok 4...");
+    // Membuat Client ID acak agar tidak bentrok di broker publik
+    String clientString = "ESP32-Kandang4-" + String(random(0, 9999));
+    if (client.connect(clientString.c_str())) {
+      Serial.println("Terhubung ke MQTT Broker!");
+    } else {
+      Serial.print("Gagal, rc=");
+      Serial.print(client.state());
+      Serial.println(" Coba lagi dalam 5 detik...");
+      delay(5000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Inisialisasi Pin Aktuator
+  pinMode(PIN_BLOWER_DINGIN, OUTPUT);
+  pinMode(PIN_PAKET_PEMANAS, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  
+  // Kondisi Awal (Mati)
+  digitalWrite(PIN_BLOWER_DINGIN, HIGH); // Relay Aktif LOW -> HIGH = MATI
+  digitalWrite(PIN_PAKET_PEMANAS, HIGH); // Relay Aktif LOW -> HIGH = MATI
+  digitalWrite(PIN_BUZZER, LOW);         // Buzzer Aktif HIGH -> LOW = MATI
+
+  setup_wifi();
+  client.setServer(mqtt_broker, mqtt_port);
+}
+
+void loop() {
+  yield();
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  static unsigned long waktuTerakhir = 0;
+  // Membaca sensor dan mengirim data setiap 3 detik
+  if (millis() - waktuTerakhir > 3000) { 
+    waktuTerakhir = millis();
+
+    // --- A. BACA SENSOR DHT11 ---
+    byte temperature = 0;
+    byte humidity = 0;
+    float suhuSekarang = 0.0;
+    float lembapSekarang = 0.0;
+
+    if (dht11.read(&temperature, &humidity, NULL) == SimpleDHTErrSuccess) {
+      suhuSekarang = (float)temperature;
+      lembapSekarang = (float)humidity;
+    }
+
+    // --- B. BACA SENSOR MQ-135 ---
+    int nilaiAmonia = analogRead(PIN_MQ135);
+
+    // --- C. LOGIKA MITIGASI HEAT STRESS & KENDALI AKTUATOR ---
+    String statusResiko = "NORMAL";
+
+    // KONDISI 1: BAHAYA (Suhu ekstrim Kritis >= 35°C ATAU Gas Amonia Pekat Beracun)
+    if (suhuSekarang >= 35.0 || nilaiAmonia > AMBANG_AMONIA) {
+      statusResiko = "BAHAYA";
+      digitalWrite(PIN_PAKET_PEMANAS, HIGH);  // MATI
+      digitalWrite(PIN_BLOWER_DINGIN, LOW);   // NYALA (Blower membuang udara panas/racun keluar)
+      digitalWrite(PIN_BUZZER, HIGH);         // BUZZER AKTIF JERIT-JERIT (Hanya di kondisi BAHAYA)
+    }
+    // KONDISI 2: WASPADA (Suhu mulai hangat di atas batas ideal)
+    else if (suhuSekarang > AMBANG_SUHU_PANAS && suhuSekarang < 35.0) {
+      statusResiko = "WASPADA";
+      digitalWrite(PIN_PAKET_PEMANAS, HIGH);  // MATI
+      digitalWrite(PIN_BLOWER_DINGIN, LOW);   // NYALA (Blower sirkulasi udara lokal)
+      digitalWrite(PIN_BUZZER, LOW);          // BUZZER MATI
+    }
+    // KONDISI 3: DINGIN (Suhu di bawah batas ideal anakan ayam)
+    else if (suhuSekarang < AMBANG_SUHU_DINGIN && suhuSekarang > 0) {
+      statusResiko = "NORMAL"; 
+      digitalWrite(PIN_PAKET_PEMANAS, LOW);   // NYALA (Lampu/pemanas aktif menghangatkan)
+      digitalWrite(PIN_BLOWER_DINGIN, HIGH);  // MATI
+      digitalWrite(PIN_BUZZER, LOW);          // BUZZER MATI
+    }
+    // KONDISI 4: IDEAL / NORMAL (Suhu nyaman di rentang 26°C - 32°C)
+    else {
+      statusResiko = "NORMAL";
+      digitalWrite(PIN_PAKET_PEMANAS, HIGH);  // MATI
+      digitalWrite(PIN_BLOWER_DINGIN, HIGH); // MATI
+      digitalWrite(PIN_BUZZER, LOW);          // BUZZER MATI
+    }
+
+    // --- D. BUNGKUS KE FORMAT JSON & PUBLISH KE NODE-RED ---
+    String payload = "{\"suhu\":" + String(suhuSekarang, 0) + 
+                     ",\"lembap\":" + String(lembapSekarang, 0) + 
+                     ",\"amonia\":" + String(nilaiAmonia) + 
+                     ",\"status\":\"" + statusResiko + "\"}";
+    
+    Serial.print("Mengirim data Kelompok 4 ke Node-RED: ");
+    Serial.println(payload);
+    
+    client.publish(mqtt_topic, payload.c_str());
+    Serial.println("-----------------------------------------");
+  }
+}
